@@ -1,0 +1,24 @@
+# Dependencies and generated environments
+node_modules/
+apps/transcriber/venv/
+
+# Environment files
+.env
+.env.*
+!.env.example
+
+# Build and tool output
+.next/
+out/
+dist/
+coverage/
+*.tsbuildinfo
+
+# Prisma generated client
+packages/database/generated/
+
+# Logs and local data
+*.log
+npm-debug.log*
+postgres_data/
+redis_data/
