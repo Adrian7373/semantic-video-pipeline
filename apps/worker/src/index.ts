@@ -1,13 +1,24 @@
 import "dotenv/config";
+import { GetObjectCommand, S3Client } from "@aws-sdk/client-s3";
 import { Job, Worker } from "bullmq";
+import ffmpeg from "fluent-ffmpeg";
+import { createWriteStream } from "node:fs";
+import { rm } from "node:fs/promises";
+import { Readable } from "node:stream";
+import { pipeline } from "node:stream/promises";
 import { Redis } from "ioredis";
 import { z } from "zod";
 
 const QUEUE_NAME = "video-processing";
 const JOB_NAME = "process-video";
+const s3Bucket = process.env.S3_BUCKET_NAME;
 
 const redis = new Redis(process.env.REDIS_URL ?? "redis://localhost:6379", {
   maxRetriesPerRequest: null,
+});
+
+const s3 = new S3Client({
+  ...(process.env.AWS_REGION ? { region: process.env.AWS_REGION } : {}),
 });
 
 const videoProcessingJobSchema = z.object({
@@ -17,6 +28,44 @@ const videoProcessingJobSchema = z.object({
 });
 
 type VideoProcessingJob = z.infer<typeof videoProcessingJobSchema>;
+
+async function downloadS3File(
+  s3Key: string,
+  downloadPath: string,
+): Promise<void> {
+  if (!s3Bucket) {
+    throw new Error("S3_BUCKET_NAME must be configured.");
+  }
+
+  const response = await s3.send(
+    new GetObjectCommand({
+      Bucket: s3Bucket,
+      Key: s3Key,
+    }),
+  );
+
+  if (!response.Body) {
+    throw new Error(`S3 object "${s3Key}" did not contain a response body.`);
+  }
+
+  await pipeline(
+    Readable.from(response.Body as AsyncIterable<Uint8Array>),
+    createWriteStream(downloadPath),
+  );
+}
+
+function extractAudio(videoPath: string, audioPath: string): Promise<void> {
+  return new Promise((resolve, reject) => {
+    ffmpeg(videoPath)
+      .noVideo()
+      .audioCodec("libmp3lame")
+      .audioBitrate("128k")
+      .format("mp3")
+      .on("end", () => resolve())
+      .on("error", reject)
+      .save(audioPath);
+  });
+}
 
 const worker = new Worker<VideoProcessingJob, { status: "completed" }>(
   QUEUE_NAME,
@@ -28,6 +77,12 @@ const worker = new Worker<VideoProcessingJob, { status: "completed" }>(
     }
 
     const jobData = videoProcessingJobSchema.parse(job.data);
+    if (!job.id) {
+      throw new Error("Video-processing jobs must have a job ID.");
+    }
+
+    const videoPath = `/tmp/${job.id}.mp4`;
+    const audioPath = `/tmp/${job.id}.mp3`;
 
     console.log("Received video-processing job from producer endpoint", {
       jobId: job.id,
@@ -37,7 +92,17 @@ const worker = new Worker<VideoProcessingJob, { status: "completed" }>(
       userId: jobData.userId,
     });
 
-    return { status: "completed" };
+    try {
+      await downloadS3File(jobData.s3Key, videoPath);
+      await extractAudio(videoPath, audioPath);
+
+      return { status: "completed" };
+    } finally {
+      await Promise.all([
+        rm(videoPath, { force: true }),
+        rm(audioPath, { force: true }),
+      ]);
+    }
   },
   { connection: redis },
 );
