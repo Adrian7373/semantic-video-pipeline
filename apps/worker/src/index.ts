@@ -117,6 +117,23 @@ function extractAudio(videoPath: string, audioPath: string): Promise<void> {
     });
 }
 
+function sliceVideo(
+    inputPath: string,
+    outputPath: string,
+    startTime: number,
+    duration: number,
+): Promise<void> {
+    return new Promise((resolve, reject) => {
+        ffmpeg(inputPath)
+            .setStartTime(startTime)
+            .setDuration(duration)
+            .outputOptions(["-c", "copy"])
+            .on("end", () => resolve())
+            .on("error", reject)
+            .save(outputPath);
+    });
+}
+
 const worker = new Worker<VideoProcessingJob, { status: "completed" }>(
     QUEUE_NAME,
     async (job: Job<VideoProcessingJob>) => {
@@ -133,6 +150,7 @@ const worker = new Worker<VideoProcessingJob, { status: "completed" }>(
 
         const videoPath = `/tmp/${job.id}.mp4`;
         const audioPath = `/tmp/${job.id}.mp3`;
+        const generatedClips: string[] = [];
 
         console.log("Received video-processing job from producer endpoint", {
             jobId: job.id,
@@ -178,11 +196,32 @@ ${transcript}`,
 
             console.log("Parsed structured transcript data:", structuredData);
 
+            for (const [index, segment] of structuredData.segments.entries()) {
+                const duration = segment.end_time - segment.start_time;
+                if (duration <= 0) {
+                    throw new Error(
+                        `Invalid duration for segment ${index}: ${segment.start_time} to ${segment.end_time}.`,
+                    );
+                }
+
+                const outputPath = `/tmp/${job.id}-segment-${index}.mp4`;
+                generatedClips.push(outputPath);
+                await sliceVideo(
+                    videoPath,
+                    outputPath,
+                    segment.start_time,
+                    duration,
+                );
+            }
+
             return { status: "completed" };
         } finally {
             await Promise.all([
                 rm(videoPath, { force: true }),
                 rm(audioPath, { force: true }),
+                ...generatedClips.map((clipPath) =>
+                    rm(clipPath, { force: true }),
+                ),
             ]);
         }
     },
