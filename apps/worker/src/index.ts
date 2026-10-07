@@ -11,6 +11,8 @@ import { z } from "zod";
 import axios from "axios";
 import FormData from "form-data";
 import { createReadStream } from "node:fs";
+import { generateObject } from "ai";
+import { google } from "@ai-sdk/google";
 
 const QUEUE_NAME = "video-processing";
 const JOB_NAME = "process-video";
@@ -31,6 +33,51 @@ const videoProcessingJobSchema = z.object({
 });
 
 type VideoProcessingJob = z.infer<typeof videoProcessingJobSchema>;
+
+const transcriptSegmentSchema = z
+    .object({
+        start: z.number(),
+        end: z.number(),
+        text: z.string(),
+    })
+    .strict();
+
+const transcriptResponseSchema = z
+    .object({
+        segments: z.array(transcriptSegmentSchema),
+        language: z.string(),
+    })
+    .strict();
+
+const structuredDataSchema = z
+    .object({
+        segments: z
+            .array(
+                z
+                    .object({
+                        segment_title: z.string(),
+                        start_time: z.number(),
+                        end_time: z.number(),
+                        summary: z.string(),
+                        quiz: z
+                            .array(
+                                z
+                                    .object({
+                                        question: z.string(),
+                                        options: z.array(z.string()),
+                                        answer: z.string(),
+                                    })
+                                    .strict(),
+                            )
+                            .min(1),
+                    })
+                    .strict(),
+            )
+            .min(1),
+    })
+    .strict();
+
+type StructuredData = z.infer<typeof structuredDataSchema>;
 
 async function downloadS3File(
     s3Key: string,
@@ -113,10 +160,24 @@ const worker = new Worker<VideoProcessingJob, { status: "completed" }>(
                 timeout: 300000,
             });
 
-            const transcriptData = flaskResponse.data;
+            const transcriptData = transcriptResponseSchema.parse(flaskResponse.data);
             console.log("Received transcript from Flask:", transcriptData);
 
-            // Next up: send transcriptData to the LLM!
+            const transcript = JSON.stringify(transcriptData.segments);
+            const { object: structuredData }: { object: StructuredData } =
+                await generateObject({
+                    model: google("gemini-3.1-flash-lite"),
+                    schema: structuredDataSchema,
+                    prompt: `Group the following timestamped transcript chunks into coherent thematic video segments.
+
+Use the exact decimal timestamps from the transcript chunks for each segment's start_time and end_time. Each segment must begin at the start timestamp of its first included chunk and end at the end timestamp of its last included chunk. Do not invent, round, or alter timestamps. Give each segment a concise title and summary. Create at least one quiz question per segment, with answer options and the correct answer.
+
+Transcript chunks:
+${transcript}`,
+                });
+
+            console.log("Parsed structured transcript data:", structuredData);
+
             return { status: "completed" };
         } finally {
             await Promise.all([
