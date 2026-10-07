@@ -6,6 +6,7 @@ apps/transcriber/venv/
 .env
 .env.*
 !.env.example
+.env.example
 
 # Build and tool output
 .next/
