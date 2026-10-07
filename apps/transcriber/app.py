@@ -1,22 +1,69 @@
 import os
 import tempfile
-from typing import Any
+from functools import lru_cache
+from typing import Any, TypedDict
 
+import whisperx
+from faster_whisper import WhisperModel
 from flask import Flask, jsonify, request
 from werkzeug.datastructures import FileStorage
 
 app = Flask(__name__)
 
+DEVICE = os.getenv("WHISPER_DEVICE", "cpu")
+COMPUTE_TYPE = os.getenv("WHISPER_COMPUTE_TYPE", "int8")
+MODEL_SIZE = os.getenv("WHISPER_MODEL_SIZE", "small")
 
-def transcribe_audio(audio_path: str) -> list[dict[str, Any]]:
-    """Placeholder for the faster-whisper transcription call."""
-    return [
-        {
-            "start": 0.0,
-            "end": 12.5,
-            "text": "Sample lecture transcript...",
-        }
+
+class TranscriptSegment(TypedDict):
+    start: float
+    end: float
+    text: str
+
+
+class TranscriptionResponse(TypedDict):
+    segments: list[TranscriptSegment]
+    language: str
+
+
+@lru_cache(maxsize=1)
+def get_whisper_model() -> WhisperModel:
+    return WhisperModel(MODEL_SIZE, device=DEVICE, compute_type=COMPUTE_TYPE)
+
+
+def transcribe_audio(audio_path: str) -> TranscriptionResponse:
+    """Transcribe audio with faster-whisper and align timestamps with WhisperX."""
+    model = get_whisper_model()
+    segments, info = model.transcribe(audio_path)
+    transcript_segments = [
+        {"start": segment.start, "end": segment.end, "text": segment.text}
+        for segment in segments
     ]
+
+    align_model, align_metadata = whisperx.load_align_model(
+        language_code=info.language,
+        device=DEVICE,
+    )
+    aligned = whisperx.align(
+        transcript_segments,
+        align_model,
+        align_metadata,
+        audio_path,
+        DEVICE,
+        return_char_alignments=False,
+    )
+
+    return {
+        "segments": [
+            {
+                "start": float(segment["start"]),
+                "end": float(segment["end"]),
+                "text": str(segment["text"]),
+            }
+            for segment in aligned["segments"]
+        ],
+        "language": info.language,
+    }
 
 
 @app.post("/transcribe")
