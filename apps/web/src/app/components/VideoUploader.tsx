@@ -28,6 +28,7 @@ export default function VideoUploader() {
 
     const handleSubmit = async (event: FormEvent<HTMLFormElement>) => {
         event.preventDefault();
+        const form = event.currentTarget;
 
         if (!file) {
             setStatus("error");
@@ -74,7 +75,7 @@ export default function VideoUploader() {
             }
 
             setFile(null);
-            event.currentTarget.reset();
+            form.reset();
         } catch (error) {
             console.error("Video upload failed.", error);
             setStatus("error");
