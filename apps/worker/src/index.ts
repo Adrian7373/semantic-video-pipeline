@@ -6,17 +6,20 @@ import {
 } from "@aws-sdk/client-s3";
 import { Job, Worker } from "bullmq";
 import ffmpeg from "fluent-ffmpeg";
-import { createWriteStream } from "node:fs";
-import { rm } from "node:fs/promises";
+import { mkdir, rm } from "node:fs/promises";
+import { createWriteStream, createReadStream, existsSync } from "node:fs";
 import { tmpdir } from "node:os";
-import { join } from "node:path";
+import { dirname, join } from "node:path";
+import { platform } from "node:os";
+import { execFileSync } from "node:child_process";
 import { Readable } from "node:stream";
 import { pipeline } from "node:stream/promises";
+import type { ReadableStream as NodeReadableStream } from "node:stream/web";
+import { NodeHttpHandler } from "@smithy/node-http-handler";
 import { Redis } from "ioredis";
 import { z } from "zod";
 import axios from "axios";
 import FormData from "form-data";
-import { createReadStream } from "node:fs";
 import { generateObject } from "ai";
 import { google } from "@ai-sdk/google";
 import { prisma } from "../../../packages/database/index.js";
@@ -31,6 +34,11 @@ const redis = new Redis(process.env.REDIS_URL ?? "redis://localhost:6379", {
 
 const s3 = new S3Client({
     ...(process.env.AWS_REGION ? { region: process.env.AWS_REGION } : {}),
+    maxAttempts: 5,
+    requestHandler: new NodeHttpHandler({
+        connectionTimeout: 30_000,
+        socketTimeout: 10 * 60 * 1000,
+    }),
 });
 
 const videoProcessingJobSchema = z.object({
@@ -86,6 +94,49 @@ const structuredDataSchema = z
 
 type StructuredData = z.infer<typeof structuredDataSchema>;
 
+function configureFfmpeg(): void {
+    const configuredPath = process.env.FFMPEG_PATH;
+    const standardPaths =
+        platform() === "win32"
+            ? [
+                "C:\\ffmpeg\\bin\\ffmpeg.exe",
+                "C:\\Program Files\\ffmpeg\\bin\\ffmpeg.exe",
+                "C:\\Program Files (x86)\\ffmpeg\\bin\\ffmpeg.exe",
+            ]
+            : ["/usr/bin/ffmpeg", "/usr/local/bin/ffmpeg"];
+    const executablePath =
+        configuredPath ??
+        standardPaths.find((candidate) => existsSync(candidate));
+    const pathExecutable = (() => {
+        try {
+            const command = platform() === "win32" ? "where.exe" : "which";
+            return execFileSync(command, ["ffmpeg"], {
+                encoding: "utf8",
+                stdio: ["ignore", "pipe", "ignore"],
+            })
+                .trim()
+                .split(/\r?\n/)[0];
+        } catch {
+            return undefined;
+        }
+    })();
+
+    if (configuredPath && !existsSync(configuredPath)) {
+        throw new Error(`FFMPEG_PATH does not exist: "${configuredPath}".`);
+    }
+
+    const resolvedPath = executablePath ?? pathExecutable;
+    if (!resolvedPath) {
+        throw new Error(
+            "FFmpeg is required but was not found. Install FFmpeg or set FFMPEG_PATH to the executable path.",
+        );
+    }
+
+    ffmpeg.setFfmpegPath(resolvedPath);
+}
+
+configureFfmpeg();
+
 async function downloadS3File(
     s3Key: string,
     downloadPath: string,
@@ -94,33 +145,57 @@ async function downloadS3File(
         throw new Error("S3_BUCKET_NAME must be configured.");
     }
 
-    const response = await s3.send(
-        new GetObjectCommand({
-            Bucket: s3Bucket,
-            Key: s3Key,
-        }),
-    );
+    const abortController = new AbortController();
+    const timeout = setTimeout(() => {
+        abortController.abort(
+            new Error(`Timed out downloading S3 object "${s3Key}".`),
+        );
+    }, 10 * 60 * 1000);
 
-    if (!response.Body) {
-        throw new Error(`S3 object "${s3Key}" did not contain a response body.`);
+    try {
+        console.log(`Downloading S3 object "${s3Key}"...`);
+        const response = await s3.send(
+            new GetObjectCommand({
+                Bucket: s3Bucket,
+                Key: s3Key,
+            }),
+            { abortSignal: abortController.signal },
+        );
+
+        if (!response.Body) {
+            throw new Error(`S3 object "${s3Key}" did not contain a response body.`);
+        }
+
+        console.log(
+            `S3 headers received${response.ContentLength === undefined ? "." : ` (${response.ContentLength} bytes).`}`,
+        );
+        const bodyStream = Readable.fromWeb(
+            response.Body.transformToWebStream() as unknown as NodeReadableStream<Uint8Array>,
+        );
+        await pipeline(bodyStream, createWriteStream(downloadPath));
+        console.log(`Saved S3 object to "${downloadPath}".`);
+    } catch (error) {
+        await rm(downloadPath, { force: true });
+        throw error;
+    } finally {
+        clearTimeout(timeout);
     }
-
-    await pipeline(
-        Readable.from(response.Body as AsyncIterable<Uint8Array>),
-        createWriteStream(downloadPath),
-    );
 }
 
 function extractAudio(videoPath: string, audioPath: string): Promise<void> {
+    console.log("Extracting audio...");
     return new Promise((resolve, reject) => {
         ffmpeg(videoPath)
-            .noVideo()
-            .audioCodec("libmp3lame")
-            .audioBitrate("128k")
-            .format("mp3")
+            .noVideo() // Equivalent to -vn
+            .audioCodec("libmp3lame") // Equivalent to -c:a libmp3lame
+            .audioBitrate("128k") // Equivalent to -b:a 128k
+            .format("mp3") // Equivalent to -f mp3
+            .on("start", (commandLine) => {
+                console.log(`FFmpeg audio command: ${commandLine}`);
+            })
             .on("end", () => resolve())
-            .on("error", reject)
-            .save(audioPath);
+            .on("error", (error) => reject(error))
+            .save(audioPath); // fluent-ffmpeg automatically handles the -y overwrite flag
     });
 }
 
