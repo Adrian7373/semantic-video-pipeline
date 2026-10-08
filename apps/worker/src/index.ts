@@ -1,5 +1,9 @@
 import "dotenv/config";
-import { GetObjectCommand, S3Client } from "@aws-sdk/client-s3";
+import {
+    GetObjectCommand,
+    PutObjectCommand,
+    S3Client,
+} from "@aws-sdk/client-s3";
 import { Job, Worker } from "bullmq";
 import ffmpeg from "fluent-ffmpeg";
 import { createWriteStream } from "node:fs";
@@ -13,6 +17,7 @@ import FormData from "form-data";
 import { createReadStream } from "node:fs";
 import { generateObject } from "ai";
 import { google } from "@ai-sdk/google";
+import { prisma } from "../../../packages/database/index.js";
 
 const QUEUE_NAME = "video-processing";
 const JOB_NAME = "process-video";
@@ -134,6 +139,21 @@ function sliceVideo(
     });
 }
 
+async function uploadS3File(localPath: string, s3Key: string): Promise<void> {
+    if (!s3Bucket) {
+        throw new Error("S3_BUCKET_NAME must be configured.");
+    }
+
+    await s3.send(
+        new PutObjectCommand({
+            Bucket: s3Bucket,
+            Key: s3Key,
+            Body: createReadStream(localPath),
+            ContentType: "video/mp4",
+        }),
+    );
+}
+
 const worker = new Worker<VideoProcessingJob, { status: "completed" }>(
     QUEUE_NAME,
     async (job: Job<VideoProcessingJob>) => {
@@ -213,6 +233,41 @@ ${transcript}`,
                     duration,
                 );
             }
+
+            for (const [index, segment] of structuredData.segments.entries()) {
+                const localClipPath = generatedClips[index];
+                if (!localClipPath) {
+                    throw new Error(
+                        `Missing local clip for segment ${index}.`,
+                    );
+                }
+
+                const clipS3Key = `processed-videos/${job.id}-segment-${index}.mp4`;
+                await uploadS3File(localClipPath, clipS3Key);
+            }
+
+            await prisma.$transaction(async (transaction) => {
+                await transaction.videoSegment.createMany({
+                    data: structuredData.segments.map((segment, index) => {
+                        const clipS3Key = `processed-videos/${job.id}-segment-${index}.mp4`;
+
+                        return {
+                            videoId: jobData.videoId,
+                            clipS3Key,
+                            startTime: String(segment.start_time),
+                            endTime: String(segment.end_time),
+                            title: segment.segment_title,
+                            summary: segment.summary,
+                            quiz: segment.quiz,
+                        };
+                    }),
+                });
+
+                await transaction.video.update({
+                    where: { id: jobData.videoId },
+                    data: { status: "COMPLETED" },
+                });
+            });
 
             return { status: "completed" };
         } finally {
