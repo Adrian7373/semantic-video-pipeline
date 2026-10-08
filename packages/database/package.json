@@ -13,8 +13,10 @@
   "license": "ISC",
   "type": "module",
   "dependencies": {
+    "@prisma/adapter-pg": "^7.10.0",
     "@prisma/client": "7.10.0",
     "dotenv": "17.4.2",
+    "pg": "^8.23.1",
     "prisma": "7.10.0"
   }
 }

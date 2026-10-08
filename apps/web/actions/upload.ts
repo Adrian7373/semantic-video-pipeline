@@ -36,7 +36,7 @@ const s3 = new S3Client({
   region: process.env.AWS_REGION,
 });
 
-export async function createUploadUrl(
+export async function getPresignedUploadUrl(
   metadata: UploadMetadata,
 ): Promise<PresignedUpload> {
   const parsedMetadata = uploadMetadataSchema.parse(metadata);
@@ -63,3 +63,5 @@ export async function createUploadUrl(
     s3Key,
   };
 }
+
+export const createUploadUrl = getPresignedUploadUrl;
