@@ -8,6 +8,8 @@ import { Job, Worker } from "bullmq";
 import ffmpeg from "fluent-ffmpeg";
 import { createWriteStream } from "node:fs";
 import { rm } from "node:fs/promises";
+import { tmpdir } from "node:os";
+import { join } from "node:path";
 import { Readable } from "node:stream";
 import { pipeline } from "node:stream/promises";
 import { Redis } from "ioredis";
@@ -168,8 +170,8 @@ const worker = new Worker<VideoProcessingJob, { status: "completed" }>(
             throw new Error("Video-processing jobs must have a job ID.");
         }
 
-        const videoPath = `/tmp/${job.id}.mp4`;
-        const audioPath = `/tmp/${job.id}.mp3`;
+        const videoPath = join(tmpdir(), `${job.id}.mp4`);
+        const audioPath = join(tmpdir(), `${job.id}.mp3`);
         const generatedClips: string[] = [];
 
         console.log("Received video-processing job from producer endpoint", {
@@ -224,7 +226,10 @@ ${transcript}`,
                     );
                 }
 
-                const outputPath = `/tmp/${job.id}-segment-${index}.mp4`;
+                const outputPath = join(
+                    tmpdir(),
+                    `${job.id}-segment-${index}.mp4`,
+                );
                 generatedClips.push(outputPath);
                 await sliceVideo(
                     videoPath,
