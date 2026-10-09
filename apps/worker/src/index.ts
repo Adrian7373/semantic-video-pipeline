@@ -8,10 +8,13 @@ import { Job, Worker } from "bullmq";
 import ffmpeg from "fluent-ffmpeg";
 import { mkdir, rm } from "node:fs/promises";
 import { createWriteStream, createReadStream, existsSync } from "node:fs";
-import { tmpdir } from "node:os";
-import { dirname, join } from "node:path";
+import { join } from "node:path";
 import { platform } from "node:os";
-import { execFileSync } from "node:child_process";
+import {
+    execFile,
+    execFileSync,
+    type ExecException,
+} from "node:child_process";
 import { Readable } from "node:stream";
 import { pipeline } from "node:stream/promises";
 import type { ReadableStream as NodeReadableStream } from "node:stream/web";
@@ -27,6 +30,7 @@ import { prisma } from "../../../packages/database/index.js";
 const QUEUE_NAME = "video-processing";
 const JOB_NAME = "process-video";
 const s3Bucket = process.env.S3_BUCKET_NAME;
+const LOCAL_TMP_DIR = join(process.cwd(), ".tmp");
 
 const redis = new Redis(process.env.REDIS_URL ?? "redis://localhost:6379", {
     maxRetriesPerRequest: null,
@@ -94,6 +98,9 @@ const structuredDataSchema = z
 
 type StructuredData = z.infer<typeof structuredDataSchema>;
 
+let ffmpegExecutablePath: string | undefined;
+let ffprobeExecutablePath: string | undefined;
+
 function configureFfmpeg(): void {
     const configuredPath = process.env.FFMPEG_PATH;
     const standardPaths =
@@ -133,6 +140,21 @@ function configureFfmpeg(): void {
     }
 
     ffmpeg.setFfmpegPath(resolvedPath);
+    ffmpegExecutablePath = resolvedPath;
+
+    try {
+        const command = platform() === "win32" ? "where.exe" : "which";
+        ffprobeExecutablePath = execFileSync(command, ["ffprobe"], {
+            encoding: "utf8",
+            stdio: ["ignore", "pipe", "ignore"],
+        })
+            .trim()
+            .split(/\r?\n/)[0];
+    } catch {
+        throw new Error(
+            "ffprobe is required to verify that the source video contains audio.",
+        );
+    }
 }
 
 configureFfmpeg();
@@ -184,18 +206,102 @@ async function downloadS3File(
 
 function extractAudio(videoPath: string, audioPath: string): Promise<void> {
     console.log("Extracting audio...");
+    if (!ffmpegExecutablePath || !ffprobeExecutablePath) {
+        return Promise.reject(
+            new Error("FFmpeg and ffprobe executable paths are not configured."),
+        );
+    }
+
+    const executablePath = ffmpegExecutablePath;
+    const probeExecutablePath = ffprobeExecutablePath;
+
     return new Promise((resolve, reject) => {
-        ffmpeg(videoPath)
-            .noVideo() // Equivalent to -vn
-            .audioCodec("libmp3lame") // Equivalent to -c:a libmp3lame
-            .audioBitrate("128k") // Equivalent to -b:a 128k
-            .format("mp3") // Equivalent to -f mp3
-            .on("start", (commandLine) => {
-                console.log(`FFmpeg audio command: ${commandLine}`);
-            })
-            .on("end", () => resolve())
-            .on("error", (error) => reject(error))
-            .save(audioPath); // fluent-ffmpeg automatically handles the -y overwrite flag
+        execFile(
+            probeExecutablePath,
+            [
+                "-v",
+                "error",
+                "-select_streams",
+                "a:0",
+                "-show_entries",
+                "stream=index",
+                "-of",
+                "json",
+                videoPath,
+            ],
+            { windowsHide: true },
+            (error: ExecException | null, stdout: string, stderr: string) => {
+                if (error) {
+                    reject(
+                        new Error(
+                            `Unable to inspect audio streams: ${stderr.trim() || error.message}`,
+                        ),
+                    );
+                    return;
+                }
+
+                let hasAudioStream = false;
+                try {
+                    const probeResult = JSON.parse(stdout) as {
+                        streams?: Array<{ index?: number }>;
+                    };
+                    hasAudioStream = (probeResult.streams?.length ?? 0) > 0;
+                } catch {
+                    reject(new Error("ffprobe returned invalid stream metadata."));
+                    return;
+                }
+
+                if (!hasAudioStream) {
+                    reject(
+                        new Error(
+                            `The source video "${videoPath}" does not contain an audio stream. Audio extraction and transcription cannot continue.`,
+                        ),
+                    );
+                    return;
+                }
+
+                const args = [
+                    "-y",
+                    "-i",
+                    videoPath,
+                    "-map",
+                    "0:a:0",
+                    "-vn",
+                    "-c:a",
+                    "libmp3lame",
+                    "-b:a",
+                    "128k",
+                    "-f",
+                    "mp3",
+                    audioPath,
+                ];
+
+                console.log(
+                    `FFmpeg audio command: ${executablePath} ${args.join(" ")}`,
+                );
+                execFile(
+                    executablePath,
+                    args,
+                    { windowsHide: true },
+                    (
+                        extractionError: ExecException | null,
+                        _extractionStdout: string,
+                        extractionStderr: string,
+                    ) => {
+                        if (extractionError) {
+                            reject(
+                                new Error(
+                                    `FFmpeg audio extraction failed: ${extractionStderr.trim() || extractionError.message}`,
+                                ),
+                            );
+                            return;
+                        }
+
+                        resolve();
+                    },
+                );
+            },
+        );
     });
 }
 
@@ -245,8 +351,9 @@ const worker = new Worker<VideoProcessingJob, { status: "completed" }>(
             throw new Error("Video-processing jobs must have a job ID.");
         }
 
-        const videoPath = join(tmpdir(), `${job.id}.mp4`);
-        const audioPath = join(tmpdir(), `${job.id}.mp3`);
+        await mkdir(LOCAL_TMP_DIR, { recursive: true });
+        const videoPath = join(LOCAL_TMP_DIR, `${job.id}.mp4`).replace(/\\/g, "/");
+        const audioPath = join(LOCAL_TMP_DIR, `${job.id}.mp3`).replace(/\\/g, "/");
         const generatedClips: string[] = [];
 
         console.log("Received video-processing job from producer endpoint", {
@@ -302,9 +409,9 @@ ${transcript}`,
                 }
 
                 const outputPath = join(
-                    tmpdir(),
+                    LOCAL_TMP_DIR,
                     `${job.id}-segment-${index}.mp4`,
-                );
+                ).replace(/\\/g, "/");
                 generatedClips.push(outputPath);
                 await sliceVideo(
                     videoPath,
