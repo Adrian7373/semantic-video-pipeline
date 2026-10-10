@@ -5,7 +5,7 @@ import { getPresignedUploadUrl } from "../../../actions/upload";
 
 type UploadStatus = "idle" | "requesting" | "uploading" | "processing" | "error";
 
-const MOCK_USER_ID = "00000000-0000-0000-0000-000000000001";
+const MOCK_USER_ID = "00000000-0000-4000-8000-000000000001";
 
 const statusLabels: Record<UploadStatus, string> = {
     idle: "Ready to upload",
