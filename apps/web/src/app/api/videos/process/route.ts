@@ -4,6 +4,9 @@ import {
   getVideoProcessingQueue,
   type VideoProcessingJobData,
 } from "@/../lib/queue";
+import { prisma } from "../../../../../../../packages/database/index";
+
+export const dynamic = "force-dynamic";
 
 const videoProcessingJobSchema = z.object({
   s3Key: z.string().min(1),
@@ -33,6 +36,28 @@ export async function POST(request: Request) {
 
   const jobData: VideoProcessingJobData = parsedBody.data;
   try {
+    const video = await prisma.video.findUnique({
+      where: { id: jobData.videoId },
+      select: { id: true, s3Key: true, userId: true, status: true },
+    });
+
+    if (
+      !video ||
+      video.s3Key !== jobData.s3Key ||
+      video.userId !== jobData.userId ||
+      video.status !== "UPLOADING"
+    ) {
+      return NextResponse.json(
+        { error: "Video upload session is invalid or already processed." },
+        { status: 409 },
+      );
+    }
+
+    await prisma.video.update({
+      where: { id: jobData.videoId },
+      data: { status: "PROCESSING" },
+    });
+
     const job = await getVideoProcessingQueue().add("process-video", jobData);
 
     return NextResponse.json(
@@ -44,6 +69,14 @@ export async function POST(request: Request) {
     );
   } catch (error) {
     console.error("Failed to enqueue video-processing job.", error);
+    await prisma.video
+      .update({
+        where: { id: jobData.videoId },
+        data: { status: "FAILED" },
+      })
+      .catch((statusError: unknown) => {
+        console.error("Failed to mark video upload as failed.", statusError);
+      });
 
     return NextResponse.json(
       { error: "Unable to queue video processing." },
