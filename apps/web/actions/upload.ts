@@ -38,31 +38,31 @@ const s3 = new S3Client({
 
 export async function getPresignedUploadUrl(
     metadata: UploadMetadata,
+    s3Key: string,
 ): Promise<PresignedUpload> {
-    console.log("Getting preiged url")
     const parsedMetadata = uploadMetadataSchema.parse(metadata);
+    const parsedS3Key = z
+        .string()
+        .regex(/^raw-videos\/[0-9a-f-]{36}-[a-zA-Z0-9._-]+$/i, "Invalid S3 key.")
+        .parse(s3Key);
     const bucket = process.env.S3_BUCKET_NAME;
     const region = process.env.AWS_REGION;
 
     if (!bucket || !region) {
         throw new Error("AWS_REGION and S3_BUCKET_NAME must be configured.");
     }
-
     const safeFilename = parsedMetadata.filename.replace(/[^a-zA-Z0-9._-]/g, "_");
-    const s3Key = `raw-videos/${crypto.randomUUID()}-${safeFilename}`;
     const command = new PutObjectCommand({
         Bucket: bucket,
-        Key: s3Key,
+        Key: parsedS3Key,
         ContentType: parsedMetadata.contentType,
         ContentLength: parsedMetadata.fileSize,
     });
     const uploadUrl = await getSignedUrl(s3, command, { expiresIn: 900 });
-    console.log("upload url: " + uploadUrl)
-
     return {
         success: true,
         uploadUrl,
-        s3Key,
+        s3Key: parsedS3Key,
     };
 }
 
