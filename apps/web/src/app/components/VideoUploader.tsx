@@ -5,7 +5,7 @@ import { getPresignedUploadUrl } from "../../../actions/upload";
 
 type UploadStatus = "idle" | "requesting" | "uploading" | "processing" | "error";
 
-const MOCK_USER_ID = "mock-user-id";
+const MOCK_USER_ID = "00000000-0000-0000-0000-000000000001";
 
 const statusLabels: Record<UploadStatus, string> = {
     idle: "Ready to upload",
@@ -37,11 +37,32 @@ export default function VideoUploader() {
 
         try {
             setStatus("requesting");
-            const { uploadUrl, s3Key } = await getPresignedUploadUrl({
+            const initializationResponse = await fetch("/api/videos/init", {
+                method: "POST",
+                headers: {
+                    "Content-Type": "application/json",
+                },
+                body: JSON.stringify({
+                    filename: file.name,
+                    contentType: file.type,
+                    fileSize: file.size,
+                    userId: MOCK_USER_ID,
+                }),
+            });
+
+            if (!initializationResponse.ok) {
+                throw new Error("The video upload could not be initialized.");
+            }
+
+            const { videoId, s3Key } = (await initializationResponse.json()) as {
+                videoId: string;
+                s3Key: string;
+            };
+            const { uploadUrl } = await getPresignedUploadUrl({
                 filename: file.name,
                 contentType: file.type,
                 fileSize: file.size,
-            });
+            }, s3Key);
 
 
             setStatus("uploading");
@@ -65,7 +86,7 @@ export default function VideoUploader() {
                 },
                 body: JSON.stringify({
                     s3Key,
-                    videoId: crypto.randomUUID(),
+                    videoId,
                     userId: MOCK_USER_ID,
                 }),
             });
