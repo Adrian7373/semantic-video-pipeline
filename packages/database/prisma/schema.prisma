@@ -32,7 +32,7 @@ model VideoSegment {
   startTime String
   endTime   String
   title     String
-  summary   String
+  keyPoints String[]
   quiz      Json
 
   video Video @relation(fields: [videoId], references: [id], onDelete: Cascade)
