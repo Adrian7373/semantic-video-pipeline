@@ -6,7 +6,7 @@ import {
 } from "@aws-sdk/client-s3";
 import { Job, Worker } from "bullmq";
 import ffmpeg from "fluent-ffmpeg";
-import { mkdir, rm } from "node:fs/promises";
+import { mkdir, rm, readFile } from "node:fs/promises";
 import { createWriteStream, createReadStream, existsSync } from "node:fs";
 import { join } from "node:path";
 import { platform } from "node:os";
@@ -370,16 +370,41 @@ const worker = new Worker<VideoProcessingJob, { status: "completed" }>(
 
             console.log(`Sending audio to Flask for transcription...`);
 
-            // 1. Create a FormData instance and attach the audio file stream
-            const formData = new FormData();
-            formData.append("file", createReadStream(audioPath));
+            // 1. Read the MP3 directly into memory to bypass stream deadlocks
+            const audioBuffer = await readFile(audioPath);
 
-            // 2. Send the POST request to your Flask microservice
+            // 2. Attach the buffer to FormData with explicit file metadata
+            const formData = new FormData();
+            formData.append("file", audioBuffer, {
+                filename: "audio.mp3",
+                contentType: "audio/mpeg",
+            });
+
+            const contentLength = await new Promise<number>((resolve, reject) => {
+                formData.getLength((error, length) => {
+                    if (error) {
+                        reject(
+                            new Error(
+                                `Unable to determine transcription upload size: ${error.message}`,
+                            ),
+                        );
+                        return;
+                    }
+
+                    resolve(length);
+                });
+            });
+
+            // 3. Send a fully sized multipart request so Flask can finish parsing it.
             const flaskUrl = process.env.TRANSCRIBER_URL ?? "http://127.0.0.1:5001";
             const flaskResponse = await axios.post(`${flaskUrl}/transcribe`, formData, {
-                headers: formData.getHeaders(),
-                // Transcriptions take time, so give Axios a generous timeout (e.g., 5 minutes)
-                timeout: 300000,
+                headers: {
+                    ...formData.getHeaders(),
+                    "Content-Length": contentLength,
+                },
+                maxBodyLength: Infinity,
+                maxContentLength: Infinity,
+                timeout: 30 * 60 * 1000,
             });
 
             const transcriptData = transcriptResponseSchema.parse(flaskResponse.data);
@@ -457,6 +482,20 @@ ${transcript}`,
             });
 
             return { status: "completed" };
+        } catch (error) {
+            try {
+                await prisma.video.update({
+                    where: { id: jobData.videoId },
+                    data: { status: "FAILED" },
+                });
+            } catch (statusError) {
+                console.error(
+                    `Failed to mark video ${jobData.videoId} as FAILED.`,
+                    statusError,
+                );
+            }
+
+            throw error;
         } finally {
             await Promise.all([
                 rm(videoPath, { force: true }),
