@@ -7,8 +7,7 @@ datasource db {
 }
 
 enum VideoStatus {
-  PENDING_UPLOAD
-  QUEUED
+  UPLOADING
   PROCESSING
   COMPLETED
   FAILED
@@ -19,7 +18,7 @@ model Video {
   userId    String      @db.Uuid
   title     String
   s3Key     String
-  status    VideoStatus @default(PENDING_UPLOAD)
+  status    VideoStatus @default(UPLOADING)
   createdAt DateTime    @default(now())
   updatedAt DateTime    @updatedAt
 
