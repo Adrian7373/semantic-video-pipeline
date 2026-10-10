@@ -77,18 +77,18 @@ const structuredDataSchema = z
                         segment_title: z.string(),
                         start_time: z.number(),
                         end_time: z.number(),
-                        summary: z.string(),
+                        key_points: z.array(z.string()).min(3).max(5),
                         quiz: z
                             .array(
                                 z
                                     .object({
                                         question: z.string(),
-                                        options: z.array(z.string()),
+                                        options: z.array(z.string()).length(4),
                                         answer: z.string(),
                                     })
                                     .strict(),
                             )
-                            .min(1),
+                            .min(3),
                     })
                     .strict(),
             )
@@ -415,10 +415,22 @@ const worker = new Worker<VideoProcessingJob, { status: "completed" }>(
                 await generateObject({
                     model: google("gemini-3.1-flash-lite"),
                     schema: structuredDataSchema,
-                    prompt: `Group the following timestamped transcript chunks into coherent thematic video segments.
+                    prompt: `You are an expert instructional designer. Your task is to analyze the following timestamped transcript chunks and group them into coherent, thematic video segments.
 
-Use the exact decimal timestamps from the transcript chunks for each segment's start_time and end_time. Each segment must begin at the start timestamp of its first included chunk and end at the end timestamp of its last included chunk. Do not invent, round, or alter timestamps. Give each segment a concise title and summary. Create at least one quiz question per segment, with answer options and the correct answer.
+Rules for Segmentation:
 
+1. Group chunks into logical segments based on distinct topic shifts.
+2. Use the exact decimal timestamps from the chunks for start_time and end_time. Do not invent, round, or alter timestamps.
+Rules for Content (Per Segment):
+
+1. segment_title: Create a punchy, specific title.
+2. key_points: Extract 3 to 5 highly specific, actionable bullet points. Do not write abstract fluff. Include specific facts, numbers, or core arguments mentioned in the text.
+3. quiz: Generate EXACTLY 3 multiple-choice questions designed to test a viewer's retention of this specific segment:
+
+- Question 1 (Factual): Test basic recall of a specific fact mentioned.
+- Question 2 (Conceptual): Test the underlying "why" or main concept of the segment.
+- Question 3 (Inference/Application): Test how the information can be applied.
+- Every question MUST have exactly 4 options. Ensure the 3 incorrect options (distractors) are highly plausible.
 Transcript chunks:
 ${transcript}`,
                 });
@@ -469,7 +481,7 @@ ${transcript}`,
                             startTime: String(segment.start_time),
                             endTime: String(segment.end_time),
                             title: segment.segment_title,
-                            summary: segment.summary,
+                            keyPoints: segment.key_points,
                             quiz: segment.quiz,
                         };
                     }),
