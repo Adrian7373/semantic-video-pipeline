@@ -1,0 +1,510 @@
+import {
+    GetObjectCommand,
+    PutObjectCommand,
+    S3Client,
+} from "@aws-sdk/client-s3";
+import type { Job } from "bullmq";
+import ffmpeg from "fluent-ffmpeg";
+import { mkdir, rm, readFile } from "node:fs/promises";
+import { createWriteStream, createReadStream, existsSync } from "node:fs";
+import { join } from "node:path";
+import { platform } from "node:os";
+import { execFile, execFileSync, type ExecException } from "node:child_process";
+import { Readable } from "node:stream";
+import { pipeline } from "node:stream/promises";
+import type { ReadableStream as NodeReadableStream } from "node:stream/web";
+import { NodeHttpHandler } from "@smithy/node-http-handler";
+import { z } from "zod";
+import axios from "axios";
+import FormData from "form-data";
+import { generateObject } from "ai";
+import { google } from "@ai-sdk/google";
+import { prisma } from "../../../../../packages/database/index.js";
+import { env } from "../../config/env.js";
+import { jobNames } from "../../constants/queues.js";
+
+const s3Bucket = env.S3_BUCKET_NAME;
+const LOCAL_TMP_DIR = join(process.cwd(), ".tmp");
+
+const s3 = new S3Client({
+    ...(env.AWS_REGION ? { region: env.AWS_REGION } : {}),
+    maxAttempts: 5,
+    requestHandler: new NodeHttpHandler({
+        connectionTimeout: 30_000,
+        socketTimeout: 10 * 60 * 1000,
+    }),
+});
+
+const videoProcessingJobSchema = z.object({
+    videoId: z.string(),
+    s3Key: z.string(),
+    userId: z.string(),
+});
+
+const transcriptSegmentSchema = z
+    .object({
+        start: z.number(),
+        end: z.number(),
+        text: z.string(),
+    })
+    .strict();
+
+const transcriptResponseSchema = z
+    .object({
+        segments: z.array(transcriptSegmentSchema),
+        language: z.string(),
+    })
+    .strict();
+
+const structuredDataSchema = z
+    .object({
+        segments: z
+            .array(
+                z
+                    .object({
+                        segment_title: z.string(),
+                        start_time: z.number(),
+                        end_time: z.number(),
+                        key_points: z.array(z.string()).min(3).max(5),
+                        quiz: z
+                            .array(
+                                z
+                                    .object({
+                                        question: z.string(),
+                                        options: z.array(z.string()).length(4),
+                                        answer: z.string(),
+                                    })
+                                    .strict(),
+                            )
+                            .min(3),
+                    })
+                    .strict(),
+            )
+            .min(1),
+    })
+    .strict();
+
+type StructuredData = z.infer<typeof structuredDataSchema>;
+
+let ffmpegExecutablePath: string | undefined;
+let ffprobeExecutablePath: string | undefined;
+
+function configureFfmpeg(): void {
+    const configuredPath = env.FFMPEG_PATH;
+    const standardPaths =
+        platform() === "win32"
+            ? [
+                "C:\\ffmpeg\\bin\\ffmpeg.exe",
+                "C:\\Program Files\\ffmpeg\\bin\\ffmpeg.exe",
+                "C:\\Program Files (x86)\\ffmpeg\\bin\\ffmpeg.exe",
+            ]
+            : ["/usr/bin/ffmpeg", "/usr/local/bin/ffmpeg"];
+    const executablePath =
+        configuredPath ??
+        standardPaths.find((candidate) => existsSync(candidate));
+    const pathExecutable = (() => {
+        try {
+            const command = platform() === "win32" ? "where.exe" : "which";
+            return execFileSync(command, ["ffmpeg"], {
+                encoding: "utf8",
+                stdio: ["ignore", "pipe", "ignore"],
+            })
+                .trim()
+                .split(/\r?\n/)[0];
+        } catch {
+            return undefined;
+        }
+    })();
+
+    if (configuredPath && !existsSync(configuredPath)) {
+        throw new Error(`FFMPEG_PATH does not exist: "${configuredPath}".`);
+    }
+
+    const resolvedPath = executablePath ?? pathExecutable;
+    if (!resolvedPath) {
+        throw new Error(
+            "FFmpeg is required but was not found. Install FFmpeg or set FFMPEG_PATH to the executable path.",
+        );
+    }
+
+    ffmpeg.setFfmpegPath(resolvedPath);
+    ffmpegExecutablePath = resolvedPath;
+
+    try {
+        const command = platform() === "win32" ? "where.exe" : "which";
+        ffprobeExecutablePath = execFileSync(command, ["ffprobe"], {
+            encoding: "utf8",
+            stdio: ["ignore", "pipe", "ignore"],
+        })
+            .trim()
+            .split(/\r?\n/)[0];
+    } catch {
+        throw new Error(
+            "ffprobe is required to verify that the source video contains audio.",
+        );
+    }
+}
+
+configureFfmpeg();
+
+async function downloadS3File(
+    s3Key: string,
+    downloadPath: string,
+): Promise<void> {
+    if (!s3Bucket) {
+        throw new Error("S3_BUCKET_NAME must be configured.");
+    }
+
+    const abortController = new AbortController();
+    const timeout = setTimeout(() => {
+        abortController.abort(
+            new Error(`Timed out downloading S3 object "${s3Key}".`),
+        );
+    }, 10 * 60 * 1000);
+
+    try {
+        console.log(`Downloading S3 object "${s3Key}"...`);
+        const response = await s3.send(
+            new GetObjectCommand({
+                Bucket: s3Bucket,
+                Key: s3Key,
+            }),
+            { abortSignal: abortController.signal },
+        );
+
+        if (!response.Body) {
+            throw new Error(`S3 object "${s3Key}" did not contain a response body.`);
+        }
+
+        console.log(
+            `S3 headers received${response.ContentLength === undefined ? "." : ` (${response.ContentLength} bytes).`}`,
+        );
+        const bodyStream = Readable.fromWeb(
+            response.Body.transformToWebStream() as unknown as NodeReadableStream<Uint8Array>,
+        );
+        await pipeline(bodyStream, createWriteStream(downloadPath));
+        console.log(`Saved S3 object to "${downloadPath}".`);
+    } catch (error) {
+        await rm(downloadPath, { force: true });
+        throw error;
+    } finally {
+        clearTimeout(timeout);
+    }
+}
+
+function extractAudio(videoPath: string, audioPath: string): Promise<void> {
+    console.log("Extracting audio...");
+    if (!ffmpegExecutablePath || !ffprobeExecutablePath) {
+        return Promise.reject(
+            new Error("FFmpeg and ffprobe executable paths are not configured."),
+        );
+    }
+
+    const executablePath = ffmpegExecutablePath;
+    const probeExecutablePath = ffprobeExecutablePath;
+
+    return new Promise((resolve, reject) => {
+        execFile(
+            probeExecutablePath,
+            [
+                "-v",
+                "error",
+                "-select_streams",
+                "a:0",
+                "-show_entries",
+                "stream=index",
+                "-of",
+                "json",
+                videoPath,
+            ],
+            { windowsHide: true },
+            (error: ExecException | null, stdout: string, stderr: string) => {
+                if (error) {
+                    reject(
+                        new Error(
+                            `Unable to inspect audio streams: ${stderr.trim() || error.message}`,
+                        ),
+                    );
+                    return;
+                }
+
+                let hasAudioStream = false;
+                try {
+                    const probeResult = JSON.parse(stdout) as {
+                        streams?: Array<{ index?: number }>;
+                    };
+                    hasAudioStream = (probeResult.streams?.length ?? 0) > 0;
+                } catch {
+                    reject(new Error("ffprobe returned invalid stream metadata."));
+                    return;
+                }
+
+                if (!hasAudioStream) {
+                    reject(
+                        new Error(
+                            `The source video "${videoPath}" does not contain an audio stream. Audio extraction and transcription cannot continue.`,
+                        ),
+                    );
+                    return;
+                }
+
+                const args = [
+                    "-y",
+                    "-i",
+                    videoPath,
+                    "-map",
+                    "0:a:0",
+                    "-vn",
+                    "-c:a",
+                    "libmp3lame",
+                    "-b:a",
+                    "128k",
+                    "-f",
+                    "mp3",
+                    audioPath,
+                ];
+
+                console.log(
+                    `FFmpeg audio command: ${executablePath} ${args.join(" ")}`,
+                );
+                execFile(
+                    executablePath,
+                    args,
+                    { windowsHide: true },
+                    (
+                        extractionError: ExecException | null,
+                        _extractionStdout: string,
+                        extractionStderr: string,
+                    ) => {
+                        if (extractionError) {
+                            reject(
+                                new Error(
+                                    `FFmpeg audio extraction failed: ${extractionStderr.trim() || extractionError.message}`,
+                                ),
+                            );
+                            return;
+                        }
+
+                        resolve();
+                    },
+                );
+            },
+        );
+    });
+}
+
+function sliceVideo(
+    inputPath: string,
+    outputPath: string,
+    startTime: number,
+    duration: number,
+): Promise<void> {
+    return new Promise((resolve, reject) => {
+        ffmpeg(inputPath)
+            .setStartTime(startTime)
+            .setDuration(duration)
+            .outputOptions(["-c", "copy"])
+            .on("end", () => resolve())
+            .on("error", reject)
+            .save(outputPath);
+    });
+}
+
+async function uploadS3File(localPath: string, s3Key: string): Promise<void> {
+    if (!s3Bucket) {
+        throw new Error("S3_BUCKET_NAME must be configured.");
+    }
+
+    await s3.send(
+        new PutObjectCommand({
+            Bucket: s3Bucket,
+            Key: s3Key,
+            Body: createReadStream(localPath),
+            ContentType: "video/mp4",
+        }),
+    );
+}
+
+export type VideoProcessingJobData = z.infer<typeof videoProcessingJobSchema>;
+
+export async function processVideo(
+    job: Job<VideoProcessingJobData>,
+): Promise<{ status: "completed" }> {
+        if (job.name !== jobNames.processVideo) {
+            throw new Error(
+                `Unsupported job "${job.name}" received by the media worker.`,
+            );
+        }
+
+        const jobData = videoProcessingJobSchema.parse(job.data);
+        if (!job.id) {
+            throw new Error("Video-processing jobs must have a job ID.");
+        }
+
+        await mkdir(LOCAL_TMP_DIR, { recursive: true });
+        const videoPath = join(LOCAL_TMP_DIR, `${job.id}.mp4`).replace(/\\/g, "/");
+        const audioPath = join(LOCAL_TMP_DIR, `${job.id}.mp3`).replace(/\\/g, "/");
+        const generatedClips: string[] = [];
+
+        console.log("Received video-processing job from producer endpoint", {
+            jobId: job.id,
+            jobName: job.name,
+            videoId: jobData.videoId,
+            s3Key: jobData.s3Key,
+            userId: jobData.userId,
+        });
+
+        try {
+            await downloadS3File(jobData.s3Key, videoPath);
+            await extractAudio(videoPath, audioPath);
+
+            console.log(`Sending audio to Flask for transcription...`);
+
+            // 1. Read the MP3 directly into memory to bypass stream deadlocks
+            const audioBuffer = await readFile(audioPath);
+
+            // 2. Attach the buffer to FormData with explicit file metadata
+            const formData = new FormData();
+            formData.append("file", audioBuffer, {
+                filename: "audio.mp3",
+                contentType: "audio/mpeg",
+            });
+
+            const contentLength = await new Promise<number>((resolve, reject) => {
+                formData.getLength((error, length) => {
+                    if (error) {
+                        reject(
+                            new Error(
+                                `Unable to determine transcription upload size: ${error.message}`,
+                            ),
+                        );
+                        return;
+                    }
+
+                    resolve(length);
+                });
+            });
+
+            // 3. Send a fully sized multipart request so Flask can finish parsing it.
+            const flaskUrl = env.TRANSCRIBER_URL;
+            const flaskResponse = await axios.post(`${flaskUrl}/transcribe`, formData, {
+                headers: {
+                    ...formData.getHeaders(),
+                    "Content-Length": contentLength,
+                },
+                maxBodyLength: Infinity,
+                maxContentLength: Infinity,
+                timeout: 30 * 60 * 1000,
+            });
+
+            const transcriptData = transcriptResponseSchema.parse(flaskResponse.data);
+            console.log("Received transcript from Flask:", transcriptData);
+
+            const transcript = JSON.stringify(transcriptData.segments);
+            const { object: structuredData }: { object: StructuredData } =
+                await generateObject({
+                    model: google("gemini-3.1-flash-lite"),
+                    schema: structuredDataSchema,
+                    prompt: `You are an expert instructional designer. Your task is to analyze the following timestamped transcript chunks and group them into coherent, thematic video segments.
+
+Rules for Segmentation:
+
+1. Group chunks into logical segments based on distinct topic shifts.
+2. Use the exact decimal timestamps from the chunks for start_time and end_time. Do not invent, round, or alter timestamps.
+Rules for Content (Per Segment):
+
+1. segment_title: Create a punchy, specific title.
+2. key_points: Extract 3 to 5 highly specific, actionable bullet points. Do not write abstract fluff. Include specific facts, numbers, or core arguments mentioned in the text.
+3. quiz: Generate EXACTLY 3 multiple-choice questions designed to test a viewer's retention of this specific segment:
+
+- Question 1 (Factual): Test basic recall of a specific fact mentioned.
+- Question 2 (Conceptual): Test the underlying "why" or main concept of the segment.
+- Question 3 (Inference/Application): Test how the information can be applied.
+- Every question MUST have exactly 4 options. Ensure the 3 incorrect options (distractors) are highly plausible.
+Transcript chunks:
+${transcript}`,
+                });
+
+            console.log("Parsed structured transcript data:", structuredData);
+
+            for (const [index, segment] of structuredData.segments.entries()) {
+                const duration = segment.end_time - segment.start_time;
+                if (duration <= 0) {
+                    throw new Error(
+                        `Invalid duration for segment ${index}: ${segment.start_time} to ${segment.end_time}.`,
+                    );
+                }
+
+                const outputPath = join(
+                    LOCAL_TMP_DIR,
+                    `${job.id}-segment-${index}.mp4`,
+                ).replace(/\\/g, "/");
+                generatedClips.push(outputPath);
+                await sliceVideo(
+                    videoPath,
+                    outputPath,
+                    segment.start_time,
+                    duration,
+                );
+            }
+
+            for (const [index, segment] of structuredData.segments.entries()) {
+                const localClipPath = generatedClips[index];
+                if (!localClipPath) {
+                    throw new Error(
+                        `Missing local clip for segment ${index}.`,
+                    );
+                }
+
+                const clipS3Key = `processed-videos/${job.id}-segment-${index}.mp4`;
+                await uploadS3File(localClipPath, clipS3Key);
+            }
+
+            await prisma.$transaction(async (transaction) => {
+                await transaction.videoSegment.createMany({
+                    data: structuredData.segments.map((segment, index) => {
+                        const clipS3Key = `processed-videos/${job.id}-segment-${index}.mp4`;
+
+                        return {
+                            videoId: jobData.videoId,
+                            clipS3Key,
+                            startTime: String(segment.start_time),
+                            endTime: String(segment.end_time),
+                            title: segment.segment_title,
+                            keyPoints: segment.key_points,
+                            quiz: segment.quiz,
+                        };
+                    }),
+                });
+
+                await transaction.video.update({
+                    where: { id: jobData.videoId },
+                    data: { status: "COMPLETED" },
+                });
+            });
+
+            return { status: "completed" };
+        } catch (error) {
+            try {
+                await prisma.video.update({
+                    where: { id: jobData.videoId },
+                    data: { status: "FAILED" },
+                });
+            } catch (statusError) {
+                console.error(
+                    `Failed to mark video ${jobData.videoId} as FAILED.`,
+                    statusError,
+                );
+            }
+
+            throw error;
+        } finally {
+            await Promise.all([
+                rm(videoPath, { force: true }),
+                rm(audioPath, { force: true }),
+                ...generatedClips.map((clipPath) =>
+                    rm(clipPath, { force: true }),
+                ),
+            ]);
+        }
+}
