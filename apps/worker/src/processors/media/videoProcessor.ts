@@ -74,17 +74,7 @@ const structuredDataSchema = z
                         start_time: z.number(),
                         end_time: z.number(),
                         key_points: z.array(z.string()).min(3).max(5),
-                        quiz: z
-                            .array(
-                                z
-                                    .object({
-                                        question: z.string(),
-                                        options: z.array(z.string()).length(4),
-                                        answer: z.string(),
-                                    })
-                                    .strict(),
-                            )
-                            .min(3),
+                        social_caption: z.string(),
                     })
                     .strict(),
             )
@@ -308,10 +298,10 @@ function buildSegmentationPrompt(
     const directive = userPrompt?.trim();
     const selectionRules = directive
         ? `The user's explicit directive is the primary filter for selecting segments: "${directive}".
-Only extract segments that match this directive. Act as an expert viral video editor and instructional designer. Prioritize moments that satisfy the directive, have a natural hook at the beginning, and reach a clean resolution at the end. Prefer short-form clips between 15 and 90 seconds unless a natural thought requires slightly longer.`
+Only extract segments that match this directive. Prioritize moments that satisfy the directive, have a natural hook at the beginning, and reach a clean resolution at the end. Prefer short-form clips between 15 and 90 seconds unless a natural thought requires slightly longer.`
         : `Identify the most engaging, high-retention thematic highlights and standalone value bombs across the video. Select moments with a natural hook at the beginning and a clean resolution at the end.`;
 
-    return `You are an expert viral video editor and instructional designer. Analyze the timestamped transcript chunks and group them into coherent, standalone short-form video segments.
+    return `You are an Expert Short-Form Viral Video Editor & Social Media Strategist. Analyze the timestamped transcript chunks and group them into coherent, standalone short-form video segments.
 
 ${selectionRules}
 
@@ -324,12 +314,8 @@ Strict timestamp rules:
 Content rules for every segment:
 1. segment_title: Create a punchy, specific, viral-worthy clip title.
 2. thumbnail_text: Create a 2 to 5 word hook in ALL CAPS designed for a high-CTR thumbnail, such as "WAIT FOR IT..." or "THE SECRET FLAW".
-3. key_points: Extract 3 to 5 highly specific, actionable bullet points. Include facts, numbers, or core arguments from the transcript.
-4. quiz: Generate exactly 3 multiple-choice questions testing this segment:
-   - Question 1: factual recall.
-   - Question 2: the underlying concept or why.
-   - Question 3: inference or application.
-   - Every question must have exactly 4 plausible options.
+3. key_points: Extract 3 to 5 specific bullet points summarizing the core hooks or talking points inside the clip.
+4. social_caption: Write a ready-to-publish social media caption with a strong one-line hook, brief context, and 3 to 5 relevant high-performing hashtags such as #shorts, #reels, or #tiktok.
 
 Transcript chunks:
 ${transcript}`;
@@ -559,8 +545,8 @@ export async function processVideo(
                             endTime: String(segment.end_time),
                             title: segment.segment_title,
                             keyPoints: segment.key_points,
-                            quiz: segment.quiz,
                             thumbnailText: segment.thumbnail_text,
+                            socialCaption: segment.social_caption,
                         };
                     }),
                 });

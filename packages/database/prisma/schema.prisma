@@ -65,7 +65,7 @@ model VideoSegment {
   endTime            String
   title              String
   keyPoints          String[]
-  quiz               Json
+  socialCaption      String?  @db.Text
   captionedClipS3Key String?
   subtitleS3Key      String?
   thumbnailS3Key     String?
