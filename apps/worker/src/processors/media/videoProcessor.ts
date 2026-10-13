@@ -36,10 +36,10 @@ const s3 = new S3Client({
 });
 
 const videoProcessingJobSchema = z.object({
-    videoId: z.string(),
+    videoId: z.string().uuid(),
     s3Key: z.string(),
-    userId: z.string(),
-    userPrompt: z.string().trim().max(1000).optional(),
+    userId: z.string().min(1),
+    userPrompt: z.string().trim().max(1000).optional().nullable(),
     aspectRatio: z
         .enum(["VERTICAL_9_16", "LANDSCAPE_16_9", "SQUARE_1_1"])
         .default("VERTICAL_9_16"),
@@ -70,6 +70,7 @@ const structuredDataSchema = z
                 z
                     .object({
                         segment_title: z.string(),
+                        thumbnail_text: z.string(),
                         start_time: z.number(),
                         end_time: z.number(),
                         key_points: z.array(z.string()).min(3).max(5),
@@ -300,17 +301,80 @@ function extractAudio(videoPath: string, audioPath: string): Promise<void> {
     });
 }
 
+function buildSegmentationPrompt(
+    transcript: string,
+    userPrompt?: string | null,
+): string {
+    const directive = userPrompt?.trim();
+    const selectionRules = directive
+        ? `The user's explicit directive is the primary filter for selecting segments: "${directive}".
+Only extract segments that match this directive. Act as an expert viral video editor and instructional designer. Prioritize moments that satisfy the directive, have a natural hook at the beginning, and reach a clean resolution at the end. Prefer short-form clips between 15 and 90 seconds unless a natural thought requires slightly longer.`
+        : `Identify the most engaging, high-retention thematic highlights and standalone value bombs across the video. Select moments with a natural hook at the beginning and a clean resolution at the end.`;
+
+    return `You are an expert viral video editor and instructional designer. Analyze the timestamped transcript chunks and group them into coherent, standalone short-form video segments.
+
+${selectionRules}
+
+Strict timestamp rules:
+1. Use the exact decimal timestamps from the transcript chunks.
+2. start_time must match the first included chunk's start timestamp.
+3. end_time must match the last included chunk's end timestamp.
+4. Never invent, round, or extrapolate timestamps.
+
+Content rules for every segment:
+1. segment_title: Create a punchy, specific, viral-worthy clip title.
+2. thumbnail_text: Create a 2 to 5 word hook in ALL CAPS designed for a high-CTR thumbnail, such as "WAIT FOR IT..." or "THE SECRET FLAW".
+3. key_points: Extract 3 to 5 highly specific, actionable bullet points. Include facts, numbers, or core arguments from the transcript.
+4. quiz: Generate exactly 3 multiple-choice questions testing this segment:
+   - Question 1: factual recall.
+   - Question 2: the underlying concept or why.
+   - Question 3: inference or application.
+   - Every question must have exactly 4 plausible options.
+
+Transcript chunks:
+${transcript}`;
+}
+
+function getAspectRatioFilter(aspectRatio: VideoProcessingJobData["aspectRatio"]): string {
+    switch (aspectRatio) {
+        case "VERTICAL_9_16":
+            return "crop='min(iw,ih*(9/16))':'min(ih,iw*(16/9))',scale=1080:1920,setsar=1";
+        case "SQUARE_1_1":
+            return "crop='min(iw,ih)':'min(iw,ih)',scale=1080:1080,setsar=1";
+        case "LANDSCAPE_16_9":
+            return "crop='min(iw,ih*(16/9))':'min(ih,iw*(9/16))',scale=1920:1080,setsar=1";
+    }
+}
+
 function sliceVideo(
     inputPath: string,
     outputPath: string,
     startTime: number,
     duration: number,
+    aspectRatio: VideoProcessingJobData["aspectRatio"],
 ): Promise<void> {
     return new Promise((resolve, reject) => {
         ffmpeg(inputPath)
             .setStartTime(startTime)
             .setDuration(duration)
-            .outputOptions(["-c", "copy"])
+            .outputOptions([
+                "-vf",
+                getAspectRatioFilter(aspectRatio),
+                "-c:v",
+                "libx264",
+                "-preset",
+                "veryfast",
+                "-crf",
+                "23",
+                "-pix_fmt",
+                "yuv420p",
+                "-c:a",
+                "aac",
+                "-b:a",
+                "128k",
+                "-movflags",
+                "+faststart",
+            ])
             .on("end", () => resolve())
             .on("error", reject)
             .save(outputPath);
@@ -353,18 +417,44 @@ export async function processVideo(
         const audioPath = join(LOCAL_TMP_DIR, `${job.id}.mp3`).replace(/\\/g, "/");
         const generatedClips: string[] = [];
 
+        try {
+        const parentVideo = await prisma.video.findUnique({
+            where: { id: jobData.videoId },
+            select: {
+                userPrompt: true,
+                aspectRatio: true,
+                captionStyle: true,
+            },
+        });
+        if (!parentVideo) {
+            throw new Error(`Video "${jobData.videoId}" was not found.`);
+        }
+
+        const rawJobData = job.data as Record<string, unknown>;
+        const effectiveJobData: VideoProcessingJobData = {
+            ...jobData,
+            userPrompt: jobData.userPrompt ?? parentVideo.userPrompt,
+            aspectRatio:
+                typeof rawJobData.aspectRatio === "string"
+                    ? jobData.aspectRatio
+                    : parentVideo.aspectRatio,
+            captionStyle:
+                typeof rawJobData.captionStyle === "string"
+                    ? jobData.captionStyle
+                    : parentVideo.captionStyle,
+        };
+
         console.log("Received video-processing job from producer endpoint", {
             jobId: job.id,
             jobName: job.name,
             videoId: jobData.videoId,
             s3Key: jobData.s3Key,
             userId: jobData.userId,
-            userPrompt: jobData.userPrompt,
-            aspectRatio: jobData.aspectRatio,
-            captionStyle: jobData.captionStyle,
+            userPrompt: effectiveJobData.userPrompt,
+            aspectRatio: effectiveJobData.aspectRatio,
+            captionStyle: effectiveJobData.captionStyle,
         });
 
-        try {
             await downloadS3File(jobData.s3Key, videoPath);
             await extractAudio(videoPath, audioPath);
 
@@ -415,27 +505,10 @@ export async function processVideo(
                 await generateObject({
                     model: google("gemini-3.1-flash-lite"),
                     schema: structuredDataSchema,
-                    prompt: `You are an expert instructional designer. Your task is to analyze the following timestamped transcript chunks and group them into coherent, thematic video segments.
-
-Rules for Segmentation:
-
-1. Group chunks into logical segments based on distinct topic shifts.
-2. Use the exact decimal timestamps from the chunks for start_time and end_time. Do not invent, round, or alter timestamps.
-Rules for Content (Per Segment):
-
-1. segment_title: Create a punchy, specific title.
-2. key_points: Extract 3 to 5 highly specific, actionable bullet points. Do not write abstract fluff. Include specific facts, numbers, or core arguments mentioned in the text.
-3. quiz: Generate EXACTLY 3 multiple-choice questions designed to test a viewer's retention of this specific segment:
-
-- Question 1 (Factual): Test basic recall of a specific fact mentioned.
-- Question 2 (Conceptual): Test the underlying "why" or main concept of the segment.
-- Question 3 (Inference/Application): Test how the information can be applied.
-- Every question MUST have exactly 4 options. Ensure the 3 incorrect options (distractors) are highly plausible.
-Additional processing instructions:
-${jobData.userPrompt ?? "Choose the most engaging and educational moments."}
-
-Transcript chunks:
-${transcript}`,
+                    prompt: buildSegmentationPrompt(
+                        transcript,
+                        effectiveJobData.userPrompt,
+                    ),
                 });
 
             console.log("Parsed structured transcript data:", structuredData);
@@ -458,6 +531,7 @@ ${transcript}`,
                     outputPath,
                     segment.start_time,
                     duration,
+                    effectiveJobData.aspectRatio,
                 );
             }
 
@@ -486,6 +560,7 @@ ${transcript}`,
                             title: segment.segment_title,
                             keyPoints: segment.key_points,
                             quiz: segment.quiz,
+                            thumbnailText: segment.thumbnail_text,
                         };
                     }),
                 });
@@ -501,7 +576,11 @@ ${transcript}`,
             try {
                 await prisma.video.update({
                     where: { id: jobData.videoId },
-                    data: { status: "FAILED" },
+                    data: {
+                        status: "FAILED",
+                        errorMessage:
+                            error instanceof Error ? error.message : String(error),
+                    },
                 });
             } catch (statusError) {
                 console.error(
