@@ -573,19 +573,29 @@ export async function processVideo(
 
             return { status: "completed" };
         } catch (error) {
-            try {
-                await prisma.video.update({
-                    where: { id: jobData.videoId },
-                    data: {
-                        status: "FAILED",
-                        errorMessage:
-                            error instanceof Error ? error.message : String(error),
-                    },
-                });
-            } catch (statusError) {
-                console.error(
-                    `Failed to mark video ${jobData.videoId} as FAILED.`,
-                    statusError,
+            const maxAttempts = job.opts.attempts ?? 1;
+            const attemptsExhausted = job.attemptsMade >= maxAttempts;
+
+            if (attemptsExhausted) {
+                try {
+                    await prisma.video.update({
+                        where: { id: jobData.videoId },
+                        data: {
+                            status: "FAILED",
+                            errorMessage:
+                                error instanceof Error ? error.message : String(error),
+                        },
+                    });
+                } catch (statusError) {
+                    console.error(
+                        `Failed to mark video ${jobData.videoId} as FAILED.`,
+                        statusError,
+                    );
+                }
+            } else {
+                console.warn(
+                    `Video ${jobData.videoId} attempt ${job.attemptsMade} of ${maxAttempts} failed; BullMQ will retry it.`,
+                    error,
                 );
             }
 
