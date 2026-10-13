@@ -18,7 +18,7 @@ export interface MediaProcessingJobData {
     videoId: string;
     s3Key: string;
     userId: string;
-    userPrompt?: string;
+    userPrompt?: string | null;
     aspectRatio: AspectRatio;
     captionStyle: CaptionStyle;
 }
