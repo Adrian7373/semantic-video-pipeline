@@ -39,6 +39,13 @@ const videoProcessingJobSchema = z.object({
     videoId: z.string(),
     s3Key: z.string(),
     userId: z.string(),
+    userPrompt: z.string().trim().max(1000).optional(),
+    aspectRatio: z
+        .enum(["VERTICAL_9_16", "LANDSCAPE_16_9", "SQUARE_1_1"])
+        .default("VERTICAL_9_16"),
+    captionStyle: z
+        .enum(["NONE", "KARAOKE", "HIGHLIGHT", "MINIMAL"])
+        .default("KARAOKE"),
 });
 
 const transcriptSegmentSchema = z
@@ -352,6 +359,9 @@ export async function processVideo(
             videoId: jobData.videoId,
             s3Key: jobData.s3Key,
             userId: jobData.userId,
+            userPrompt: jobData.userPrompt,
+            aspectRatio: jobData.aspectRatio,
+            captionStyle: jobData.captionStyle,
         });
 
         try {
@@ -421,6 +431,9 @@ Rules for Content (Per Segment):
 - Question 2 (Conceptual): Test the underlying "why" or main concept of the segment.
 - Question 3 (Inference/Application): Test how the information can be applied.
 - Every question MUST have exactly 4 options. Ensure the 3 incorrect options (distractors) are highly plausible.
+Additional processing instructions:
+${jobData.userPrompt ?? "Choose the most engaging and educational moments."}
+
 Transcript chunks:
 ${transcript}`,
                 });

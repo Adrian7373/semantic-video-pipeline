@@ -1,17 +1,25 @@
 import { NextResponse } from "next/server";
 import { z } from "zod";
 import {
-  getVideoProcessingQueue,
-  type VideoProcessingJobData,
-} from "@/../lib/queue";
-import { prisma } from "../../../../../../../packages/database/index";
+  AspectRatio,
+  CaptionStyle,
+  prisma,
+} from "../../../../../../../packages/database/index";
+import {
+  mediaProcessingQueue,
+  PROCESS_VIDEO_JOB,
+  type MediaProcessingJobData,
+} from "@/lib/queues";
 
 export const dynamic = "force-dynamic";
 
 const videoProcessingJobSchema = z.object({
   s3Key: z.string().min(1),
-  videoId: z.string().min(1),
+  videoId: z.string().uuid(),
   userId: z.string().min(1),
+  userPrompt: z.string().trim().max(1000).optional(),
+  aspectRatio: z.nativeEnum(AspectRatio).optional(),
+  captionStyle: z.nativeEnum(CaptionStyle).optional(),
 });
 
 export async function POST(request: Request) {
@@ -34,17 +42,25 @@ export async function POST(request: Request) {
     );
   }
 
-  const jobData: VideoProcessingJobData = parsedBody.data;
+  const requestData = parsedBody.data;
   try {
     const video = await prisma.video.findUnique({
-      where: { id: jobData.videoId },
-      select: { id: true, s3Key: true, userId: true, status: true },
+      where: { id: requestData.videoId },
+      select: {
+        id: true,
+        s3Key: true,
+        userId: true,
+        status: true,
+        userPrompt: true,
+        aspectRatio: true,
+        captionStyle: true,
+      },
     });
 
     if (
       !video ||
-      video.s3Key !== jobData.s3Key ||
-      video.userId !== jobData.userId ||
+      video.s3Key !== requestData.s3Key ||
+      video.userId !== requestData.userId ||
       video.status !== "UPLOADING"
     ) {
       return NextResponse.json(
@@ -53,12 +69,37 @@ export async function POST(request: Request) {
       );
     }
 
+    const jobData: MediaProcessingJobData = {
+      videoId: video.id,
+      s3Key: video.s3Key,
+      userId: video.userId,
+      userPrompt: requestData.userPrompt ?? video.userPrompt ?? undefined,
+      aspectRatio: requestData.aspectRatio ?? video.aspectRatio,
+      captionStyle: requestData.captionStyle ?? video.captionStyle,
+    };
+
     await prisma.video.update({
-      where: { id: jobData.videoId },
-      data: { status: "PROCESSING" },
+      where: { id: video.id },
+      data: {
+        status: "PROCESSING",
+        errorMessage: null,
+        ...(requestData.userPrompt !== undefined ||
+        requestData.aspectRatio !== undefined ||
+        requestData.captionStyle !== undefined
+          ? {
+              userPrompt: jobData.userPrompt ?? null,
+              aspectRatio: jobData.aspectRatio,
+              captionStyle: jobData.captionStyle,
+            }
+          : {}),
+      },
     });
 
-    const job = await getVideoProcessingQueue().add("process-video", jobData);
+    const job = await mediaProcessingQueue.add(PROCESS_VIDEO_JOB, jobData, {
+      attempts: 3,
+      backoff: { type: "exponential", delay: 5000 },
+      removeOnComplete: 100,
+    });
 
     return NextResponse.json(
       {
@@ -68,11 +109,15 @@ export async function POST(request: Request) {
       { status: 202 },
     );
   } catch (error) {
-    console.error("Failed to enqueue video-processing job.", error);
+    console.error("Failed to enqueue media-processing job.", error);
     await prisma.video
       .update({
-        where: { id: jobData.videoId },
-        data: { status: "FAILED" },
+        where: { id: requestData.videoId },
+        data: {
+          status: "FAILED",
+          errorMessage:
+            error instanceof Error ? error.message : "Unable to queue video processing.",
+        },
       })
       .catch((statusError: unknown) => {
         console.error("Failed to mark video upload as failed.", statusError);

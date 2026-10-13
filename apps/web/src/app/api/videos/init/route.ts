@@ -1,6 +1,10 @@
 import { NextResponse } from "next/server";
 import { z } from "zod";
 import { prisma } from "../../../../../../../packages/database/index";
+import {
+    AspectRatio,
+    CaptionStyle,
+} from "../../../../../../../packages/database/index";
 
 export const dynamic = "force-dynamic";
 
@@ -9,6 +13,9 @@ const initializeVideoSchema = z.object({
     contentType: z.enum(["video/mp4", "video/quicktime", "video/webm"]),
     fileSize: z.number().finite().int().nonnegative(),
     userId: z.string().uuid(),
+    userPrompt: z.string().trim().max(1000).optional(),
+    aspectRatio: z.nativeEnum(AspectRatio).default("VERTICAL_9_16"),
+    captionStyle: z.nativeEnum(CaptionStyle).default("KARAOKE"),
 });
 
 export async function POST(request: Request) {
@@ -31,7 +38,13 @@ export async function POST(request: Request) {
         );
     }
 
-    const { filename, userId } = parsedBody.data;
+    const {
+        filename,
+        userId,
+        userPrompt,
+        aspectRatio,
+        captionStyle,
+    } = parsedBody.data;
     const videoId = crypto.randomUUID();
     const safeFilename = filename.replace(/[^a-zA-Z0-9._-]/g, "_");
     const s3Key = `raw-videos/${videoId}-${safeFilename}`;
@@ -44,6 +57,9 @@ export async function POST(request: Request) {
                 title: filename,
                 s3Key,
                 status: "UPLOADING",
+                userPrompt: userPrompt || null,
+                aspectRatio,
+                captionStyle,
             },
         });
 

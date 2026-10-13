@@ -2,6 +2,7 @@
 
 import { ChangeEvent, FormEvent, useState } from "react";
 import { getPresignedUploadUrl } from "../../../actions/upload";
+import type { AspectRatio, CaptionStyle } from "../../lib/queues";
 
 type UploadStatus = "idle" | "requesting" | "uploading" | "processing" | "error";
 
@@ -18,6 +19,11 @@ const statusLabels: Record<UploadStatus, string> = {
 export default function VideoUploader() {
     const [file, setFile] = useState<File | null>(null);
     const [status, setStatus] = useState<UploadStatus>("idle");
+    const [userPrompt, setUserPrompt] = useState("");
+    const [aspectRatio, setAspectRatio] =
+        useState<AspectRatio>("VERTICAL_9_16");
+    const [captionStyle, setCaptionStyle] =
+        useState<CaptionStyle>("KARAOKE");
 
     const isBusy = status === "requesting" || status === "uploading" || status === "processing";
 
@@ -47,6 +53,9 @@ export default function VideoUploader() {
                     contentType: file.type,
                     fileSize: file.size,
                     userId: MOCK_USER_ID,
+                    userPrompt,
+                    aspectRatio,
+                    captionStyle,
                 }),
             });
 
@@ -88,6 +97,9 @@ export default function VideoUploader() {
                     s3Key,
                     videoId,
                     userId: MOCK_USER_ID,
+                    userPrompt,
+                    aspectRatio,
+                    captionStyle,
                 }),
             });
 
@@ -130,6 +142,60 @@ export default function VideoUploader() {
                         className="block w-full cursor-pointer rounded-lg border border-neutral-700 bg-[#171717] text-sm text-neutral-400 file:mr-4 file:border-0 file:border-r file:border-neutral-700 file:bg-neutral-800 file:px-4 file:py-3 file:text-sm file:font-medium file:text-neutral-200 hover:file:bg-neutral-700 disabled:cursor-not-allowed disabled:opacity-50"
                     />
                 </label>
+
+                <label className="block">
+                    <span className="mb-2 block text-sm font-medium text-neutral-300">
+                        AI clipping prompt
+                    </span>
+                    <textarea
+                        value={userPrompt}
+                        onChange={(event) => setUserPrompt(event.target.value)}
+                        maxLength={1000}
+                        rows={3}
+                        placeholder="Find the funniest moments or key technical takeaways"
+                        disabled={isBusy}
+                        className="block w-full resize-y rounded-lg border border-neutral-700 bg-[#171717] px-3 py-2 text-sm text-neutral-200 placeholder:text-neutral-600 disabled:cursor-not-allowed disabled:opacity-50"
+                    />
+                </label>
+
+                <div className="grid gap-4 sm:grid-cols-2">
+                    <label className="block">
+                        <span className="mb-2 block text-sm font-medium text-neutral-300">
+                            Aspect ratio
+                        </span>
+                        <select
+                            value={aspectRatio}
+                            onChange={(event) =>
+                                setAspectRatio(event.target.value as AspectRatio)
+                            }
+                            disabled={isBusy}
+                            className="block w-full rounded-lg border border-neutral-700 bg-[#171717] px-3 py-2 text-sm text-neutral-200 disabled:opacity-50"
+                        >
+                            <option value="VERTICAL_9_16">9:16 Vertical</option>
+                            <option value="LANDSCAPE_16_9">16:9 Landscape</option>
+                            <option value="SQUARE_1_1">1:1 Square</option>
+                        </select>
+                    </label>
+
+                    <label className="block">
+                        <span className="mb-2 block text-sm font-medium text-neutral-300">
+                            Caption style
+                        </span>
+                        <select
+                            value={captionStyle}
+                            onChange={(event) =>
+                                setCaptionStyle(event.target.value as CaptionStyle)
+                            }
+                            disabled={isBusy}
+                            className="block w-full rounded-lg border border-neutral-700 bg-[#171717] px-3 py-2 text-sm text-neutral-200 disabled:opacity-50"
+                        >
+                            <option value="KARAOKE">Karaoke</option>
+                            <option value="HIGHLIGHT">Highlight</option>
+                            <option value="MINIMAL">Minimal</option>
+                            <option value="NONE">None</option>
+                        </select>
+                    </label>
+                </div>
 
                 {file && (
                     <p className="truncate rounded-lg bg-neutral-900 px-3 py-2 text-sm text-neutral-400">

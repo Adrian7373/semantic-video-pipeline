@@ -9,7 +9,7 @@ export const jobNames = {
     transcribe: "transcribe",
     createCaption: "create-caption",
     createThumbnail: "create-thumbnail",
-    publishSocial: "publish-social",
+    publishSocial: "publish-social-post",
 } as const;
 
 export type QueueName = (typeof queueNames)[keyof typeof queueNames];
