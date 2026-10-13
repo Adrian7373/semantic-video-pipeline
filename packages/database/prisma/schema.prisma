@@ -13,27 +13,102 @@ enum VideoStatus {
   FAILED
 }
 
+enum AspectRatio {
+  VERTICAL_9_16
+  LANDSCAPE_16_9
+  SQUARE_1_1
+}
+
+enum CaptionStyle {
+  NONE
+  KARAOKE
+  HIGHLIGHT
+  MINIMAL
+}
+
+enum SocialPlatform {
+  YOUTUBE_SHORTS
+  TIKTOK
+  INSTAGRAM_REELS
+  FACEBOOK_REELS
+}
+
+enum PublishStatus {
+  SCHEDULED
+  PUBLISHING
+  PUBLISHED
+  FAILED
+  CANCELLED
+}
+
 model Video {
-  id        String      @id @default(uuid()) @db.Uuid
-  userId    String      @db.Uuid
-  title     String
-  s3Key     String
-  status    VideoStatus @default(UPLOADING)
-  createdAt DateTime    @default(now())
-  updatedAt DateTime    @updatedAt
+  id           String       @id @default(uuid()) @db.Uuid
+  userId       String       @db.Uuid
+  title        String
+  s3Key        String
+  status       VideoStatus  @default(UPLOADING)
+  userPrompt   String?      @db.Text
+  aspectRatio  AspectRatio  @default(VERTICAL_9_16)
+  captionStyle CaptionStyle @default(KARAOKE)
+  errorMessage String?      @db.Text
+  createdAt    DateTime     @default(now())
+  updatedAt    DateTime     @updatedAt
 
   segments VideoSegment[]
 }
 
 model VideoSegment {
-  id        String   @id @default(uuid()) @db.Uuid
-  videoId   String   @db.Uuid
-  clipS3Key String?
-  startTime String
-  endTime   String
-  title     String
-  keyPoints String[]
-  quiz      Json
+  id                 String   @id @default(uuid()) @db.Uuid
+  videoId            String   @db.Uuid
+  clipS3Key          String
+  startTime          String
+  endTime            String
+  title              String
+  keyPoints          String[]
+  quiz               Json
+  captionedClipS3Key String?
+  subtitleS3Key      String?
+  thumbnailS3Key     String?
+  thumbnailText      String?
 
-  video Video @relation(fields: [videoId], references: [id], onDelete: Cascade)
+  video          Video           @relation(fields: [videoId], references: [id], onDelete: Cascade)
+  scheduledPosts ScheduledPost[]
+}
+
+model SocialAccount {
+  id                String         @id @default(uuid()) @db.Uuid
+  userId            String         @db.Uuid
+  platform          SocialPlatform
+  accountName       String
+  platformAccountId String
+  accessToken       String         @db.Text
+  refreshToken      String?        @db.Text
+  tokenExpiresAt    DateTime?
+  createdAt         DateTime       @default(now())
+  updatedAt         DateTime       @updatedAt
+
+  scheduledPosts ScheduledPost[]
+
+  @@unique([userId, platform, platformAccountId])
+  @@index([userId])
+}
+
+model ScheduledPost {
+  id              String        @id @default(uuid()) @db.Uuid
+  videoSegmentId  String        @db.Uuid
+  socialAccountId String        @db.Uuid
+  caption         String        @db.Text
+  scheduledFor    DateTime
+  bullMqJobId     String?       @unique
+  status          PublishStatus @default(SCHEDULED)
+  publishedUrl    String?
+  errorMessage    String?       @db.Text
+  createdAt       DateTime      @default(now())
+  updatedAt       DateTime      @updatedAt
+
+  videoSegment  VideoSegment  @relation(fields: [videoSegmentId], references: [id], onDelete: Cascade)
+  socialAccount SocialAccount @relation(fields: [socialAccountId], references: [id], onDelete: Cascade)
+
+  @@index([status, scheduledFor])
+  @@index([videoSegmentId])
 }

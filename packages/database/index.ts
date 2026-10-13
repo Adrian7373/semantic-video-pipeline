@@ -1,5 +1,20 @@
 import { PrismaPg } from "@prisma/adapter-pg";
-import { PrismaClient } from "@prisma/client";
+import {
+    PrismaClient,
+    AspectRatio,
+    CaptionStyle,
+    PublishStatus,
+    SocialPlatform,
+    VideoStatus,
+} from "@prisma/client";
+
+export {
+    AspectRatio,
+    CaptionStyle,
+    PublishStatus,
+    SocialPlatform,
+    VideoStatus,
+};
 
 const globalForPrisma = globalThis as unknown as {
     prisma: PrismaClient | undefined;
